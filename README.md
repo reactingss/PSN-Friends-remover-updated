@@ -165,6 +165,7 @@ GUI features:
 
 - Load friends, with a loading overlay while the PSN fetch runs
 - Live search-as-you-type (debounced) plus tag filtering
+- **Select All** and **Clear Selection**, with a live "N selected" badge (`Ctrl+A` / `Escape` while the table is focused)
 - Keep / Remove shown as colour-coded pill badges with live counts
 - Right-click context menu — whitelist, edit note/tag, move between buckets
 - Double-click a row to edit its note
@@ -173,6 +174,8 @@ GUI features:
 - Manage the whitelist
 - Import, export and compare backups
 - Determinate progress bar and status footer
+- Resilient bulk removal — rate limits are retried, and one failure no longer aborts the batch
+- **Stop** button to cancel a removal in progress, with a report of what was already removed
 - Toast notifications for routine feedback
 - Styled modal dialogs for errors, confirmations and prompts
 - Dark and light themes, switchable from the header toggle or the Settings menu
@@ -372,6 +375,34 @@ Treat it exactly like your PlayStation password.
 Yes.
 
 You'll always see who will be removed before confirming.
+
+---
+
+### Can I stop a removal once it has started?
+
+Yes. While a removal is running, the Unfriend button is replaced by a **Stop** button.
+
+Stop takes effect immediately, even if the tool is mid-way through waiting out a rate limit. It finishes the single removal already in flight — an in-progress request can't be safely aborted — then halts and tells you how many were removed.
+
+Be aware that **anything already removed stays removed.** Stop prevents further removals; it cannot undo the ones that already went through.
+
+---
+
+### Why did a large removal stop part-way through?
+
+It shouldn't any more.
+
+PSN rate-limits rapid bursts of removals. Previously the first rate-limit response aborted the entire batch, so a large run would stop with no report of who had actually been removed.
+
+Now every request has a bounded timeout, rate limits and server errors are retried with backoff (honouring PSN's own `Retry-After`), removals are gently throttled to stay under the limit, and a single failure no longer kills the run. When a batch finishes with errors you get a summary of exactly who could not be removed — they stay on your friends list and can simply be queued again.
+
+---
+
+### Does "Select All" respect my search filter?
+
+No — it deliberately selects your **entire** friends list.
+
+Because rows hidden by a filter don't exist in the table at all, Select All clears the search and tag boxes first, then selects everything. This keeps the selection count and the visible rows in agreement, so what you see is always what's selected.
 
 ---
 

@@ -81,7 +81,19 @@ class ThemedCanvas(tk.Canvas):
 
     def _on_theme_change(self):
         self.theme = get_theme()
+        self.invalidate_cache()
         self.redraw()
+
+    def invalidate_cache(self):
+        """Drop anything memoised from the *previous* palette.
+
+        Widgets here are expected to resolve `self.theme[...]` live inside
+        redraw(). Any subclass that instead caches a concrete hex string on the
+        instance across redraws - typically because a colour animation writes
+        interpolated values into it - MUST clear that cache here, and cancel
+        the in-flight animation too: an animation started under the old palette
+        keeps writing colours mixed from it, so clearing alone is not enough.
+        """
 
     def redraw(self):  # pragma: no cover - overridden
         pass
@@ -145,6 +157,24 @@ class Button(ThemedCanvas):
 
         self._tooltip = Tooltip(self, tooltip) if tooltip else None
         self.redraw()
+
+    # -- theming -----------------------------------------------------------
+
+    def invalidate_cache(self):
+        """Force the fill to be re-resolved against the new palette.
+
+        _current_fill holds a concrete hex - the hover fade interpolates into
+        it - and redraw() only recomputes it when it is None. Without this, a
+        theme switch repaints the button body in the *old* theme's colour while
+        the canvas background and the label, which re-read tokens every draw,
+        update correctly: the button ends up half-restyled.
+        """
+        if self._fade_handle is not None:
+            # A fade started under the old palette would otherwise keep writing
+            # mixes of two dead colours straight back into _current_fill.
+            self.cancel_tracked(self._fade_handle)
+            self._fade_handle = None
+        self._current_fill = None
 
     # -- sizing ------------------------------------------------------------
 
@@ -556,35 +586,42 @@ class InputField(ThemedFrame):
         color = theme["accent"] if self._focused else theme["text_faint"]
         icons.draw(self.icon_canvas, self.icon_name, 13, 13, 16, color)
 
+    def _apply_border(self):
+        """Paint the halo, the 1px border and the icon for the current state.
+
+        One place resolves all four colours, so a theme switch and a focus
+        change cannot drift apart.
+        """
+        theme = get_theme()
+        if self._focused:
+            halo, border = theme["accent_ring"], theme["accent"]
+        else:
+            halo, border = theme[self.parent_token], theme["border"]
+        self.configure(highlightbackground=halo, highlightcolor=halo)
+        self.inner.configure(background=theme[self.field_token],
+                             highlightbackground=border, highlightcolor=border)
+        self._draw_icon()
+
     def _restyle(self):
         super()._restyle()
         theme = get_theme()
-        self.configure(highlightbackground=theme[self.parent_token],
-                       highlightcolor=theme[self.parent_token])
-        self.inner.configure(background=theme[self.field_token],
-                             highlightbackground=theme["border"],
-                             highlightcolor=theme["border"])
         self.entry.configure(font=theme.font("body"))
-        self._focused = False
-        self._draw_icon()
+        # Re-derive focus from Tk rather than assuming it was lost: switching
+        # the theme does not move keyboard focus, so a focused field must keep
+        # its ring instead of silently reverting to the resting border.
+        try:
+            self._focused = self.entry.focus_get() is self.entry
+        except (KeyError, tk.TclError):
+            self._focused = False
+        self._apply_border()
 
     def _on_focus_in(self, _event):
-        theme = get_theme()
         self._focused = True
-        self.configure(highlightbackground=theme["accent_ring"],
-                       highlightcolor=theme["accent_ring"])
-        self.inner.configure(highlightbackground=theme["accent"],
-                             highlightcolor=theme["accent"])
-        self._draw_icon()
+        self._apply_border()
 
     def _on_focus_out(self, _event):
-        theme = get_theme()
         self._focused = False
-        self.configure(highlightbackground=theme[self.parent_token],
-                       highlightcolor=theme[self.parent_token])
-        self.inner.configure(highlightbackground=theme["border"],
-                             highlightcolor=theme["border"])
-        self._draw_icon()
+        self._apply_border()
 
 
 # --- toggle switch ----------------------------------------------------------
@@ -1120,10 +1157,14 @@ class Modal(tk.Toplevel):
                       "danger": "danger", "warning": "warning"}.get(tone, "accent")
         icon_name = icon or {"info": "info", "success": "check",
                              "danger": "warning", "warning": "warning"}.get(tone, "info")
+        self._accent_tok = accent_tok
+        self._icon_name = icon_name
+        self._details_text = None
 
         # Accent rail across the top so tone reads instantly.
         rail = ThemedCanvas(self, height=4, background=theme[accent_tok])
         rail.pack(fill=tk.X)
+        self._rail = rail
 
         body = ThemedFrame(self, token="surface")
         body.pack(fill=tk.BOTH, expand=True, padx=SPACE["xl"], pady=SPACE["xl"])
@@ -1133,11 +1174,11 @@ class Modal(tk.Toplevel):
 
         art = ThemedCanvas(head, width=44, height=44, background=theme["surface"])
         art.pack(side=tk.LEFT, anchor="n", padx=(0, SPACE["md"]))
-        draw_round_rect(art, 2, 2, 42, 42, RADIUS["md"],
-                        fill=mix(theme["surface"], theme[accent_tok], 0.16),
-                        outline=mix(theme["surface"], theme[accent_tok], 0.3),
-                        width=1)
-        icons.draw(art, icon_name, 22, 22, 22, theme[accent_tok])
+        self._art = art
+        # Bind the draw to the canvas so the Theme's own broadcast repaints it;
+        # both fills below are mix() results, which bake in two palette values.
+        art.redraw = self._draw_art
+        self._draw_art()
 
         text_col = ThemedFrame(head, token="surface")
         text_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1171,6 +1212,7 @@ class Modal(tk.Toplevel):
                            pady=SPACE["md"], insertbackground=theme["text"])
             text.insert("1.0", details)
             text.configure(state="disabled")
+            self._details_text = text
             scroll = SlimScrollbar(wrap, text.yview, bg_token="surface_sunken")
             text.configure(yscrollcommand=scroll.set)
             scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=SPACE["sm"])
@@ -1190,6 +1232,12 @@ class Modal(tk.Toplevel):
         self.bind("<Escape>", lambda e: self._close(self.escape_value))
         self.protocol("WM_DELETE_WINDOW", lambda: self._close(self.escape_value))
 
+        # A modal grabs input, so the theme cannot normally change underneath
+        # it - but nothing guarantees that, and the Toplevel background, rail,
+        # art and details Text are all painted once at construction.
+        self._unsubscribe = theme.subscribe(self._restyle)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
         self.update_idletasks()
         self._centre_on(parent)
         try:
@@ -1198,6 +1246,30 @@ class Modal(tk.Toplevel):
             pass
         if prompt is None and first_button is not None:
             first_button.focus_set()
+
+    def _draw_art(self):
+        t = get_theme()
+        self._art.configure(background=t["surface"])
+        self._art.delete("all")
+        draw_round_rect(self._art, 2, 2, 42, 42, RADIUS["md"],
+                        fill=mix(t["surface"], t[self._accent_tok], 0.16),
+                        outline=mix(t["surface"], t[self._accent_tok], 0.3),
+                        width=1)
+        icons.draw(self._art, self._icon_name, 22, 22, 22, t[self._accent_tok])
+
+    def _restyle(self):
+        t = get_theme()
+        self.configure(background=t["surface"])
+        self._rail.configure(background=t[self._accent_tok])
+        self._draw_art()
+        if self._details_text is not None:
+            self._details_text.configure(background=t["surface_sunken"],
+                                         foreground=t["text_muted"],
+                                         insertbackground=t["text"])
+
+    def _on_destroy(self, event):
+        if event.widget is self:
+            self._unsubscribe()
 
     def _centre_on(self, parent):
         self.update_idletasks()

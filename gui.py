@@ -24,6 +24,10 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "configuration.json")
 # recovered through action_from_display() wherever the tree is read back.
 ACTION_LABELS = {"Keep": "●  Keep", "Remove": "●  Remove"}
 
+# Above this many selected rows, "Edit Note/Tag" asks once and applies to all
+# instead of opening one dialog per friend.
+BULK_NOTE_THRESHOLD = 3
+
 
 def action_from_display(value):
     """Map a displayed Action cell back to the raw "Keep"/"Remove" bucket."""
@@ -85,6 +89,8 @@ class PSNUnfrienderGUI:
         self.all_friends = []
         self.auth = None
         self.last_unfriended = []
+        # Set while a removal is running so the worker can be cancelled.
+        self._stop_event = None
         self.notes = load_notes()
         self.config_error = None
         self.loaded_once = False
@@ -233,20 +239,25 @@ class PSNUnfrienderGUI:
                         pady=(SPACE["xs"], 0))
 
     def _build_filter_bar(self, parent):
+        # Two rows: filtering on top, selection underneath. One row would
+        # overflow the 940px minimum window width once both groups are present.
         bar = ThemedFrame(parent, token="bg")
         bar.grid(row=1, column=0, sticky="ew", pady=(SPACE["md"], SPACE["md"]))
 
-        search_field = InputField(bar, self.search_var, icon="search", width=24,
+        top = ThemedFrame(bar, token="bg")
+        top.pack(fill=tk.X)
+
+        search_field = InputField(top, self.search_var, icon="search", width=24,
                                   parent_token="bg")
         search_field.pack(side=tk.LEFT)
         search_field.entry.bind("<Return>", lambda e: self.apply_search())
 
-        tag_field = InputField(bar, self.tag_var, icon="tag", width=12,
+        tag_field = InputField(top, self.tag_var, icon="tag", width=12,
                                parent_token="bg")
         tag_field.pack(side=tk.LEFT, padx=(SPACE["sm"], 0))
         tag_field.entry.bind("<Return>", lambda e: self.apply_search())
 
-        Button(bar, text="Apply", variant="secondary", command=self.apply_search,
+        Button(top, text="Apply", variant="secondary", command=self.apply_search,
                bg_token="bg", height=34).pack(side=tk.LEFT, padx=(SPACE["sm"], 0))
 
         for text, icon, command, tip in (
@@ -255,10 +266,37 @@ class PSNUnfrienderGUI:
             ("Backup", "download", self.export_backup, "Export a backup JSON"),
             ("CSV", "table", self.export_csv, "Export the list as CSV"),
         ):
-            Button(bar, text=text, icon=icon, variant="secondary",
+            Button(top, text=text, icon=icon, variant="secondary",
                    command=command, bg_token="bg", height=34, pad_x=11,
                    font="small", tooltip=tip).pack(side=tk.RIGHT,
                                                    padx=(SPACE["sm"], 0))
+
+        bottom = ThemedFrame(bar, token="bg")
+        bottom.pack(fill=tk.X, pady=(SPACE["sm"], 0))
+
+        self.select_all_button = Button(
+            bottom, text="Select All", icon="check", variant="secondary",
+            command=self.select_all, bg_token="bg", height=30, pad_x=11,
+            font="small",
+            tooltip="Selects every friend in the list. Clears the search and "
+                    "tag filters first, so the table shows everything that is "
+                    "selected.")
+        self.select_all_button.pack(side=tk.LEFT)
+
+        Button(bottom, text="Clear Selection", icon="cross", variant="ghost",
+               command=self.clear_selection, bg_token="bg", height=30,
+               pad_x=11, font="small",
+               tooltip="Deselect everything (Esc in the table)").pack(
+                   side=tk.LEFT, padx=(SPACE["xs"], 0))
+
+        self.selection_badge = Badge(bottom, label="0 selected", count=None,
+                                     tone="accent", bg_token="bg", height=24)
+        self.selection_badge.pack(side=tk.LEFT, padx=(SPACE["md"], 0))
+
+        self.scope_label = ThemedLabel(bottom, text="", bg_token="bg",
+                                       fg_token="text_faint", font="micro",
+                                       anchor="w")
+        self.scope_label.pack(side=tk.LEFT, padx=(SPACE["md"], 0))
 
     def _build_table(self, parent):
         card = Card(parent, token="surface")
@@ -315,6 +353,13 @@ class PSNUnfrienderGUI:
         # selected rows get re-tagged instead of relying on the style map.
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
+        # Bound to the tree, not to root: an Entry that has focus keeps its own
+        # Ctrl+A / Escape behaviour, so typing in the token, whitelist, search
+        # or tag boxes is never hijacked by the table shortcuts.
+        self.tree.bind("<Control-a>", self._on_select_all_key)
+        self.tree.bind("<Control-A>", self._on_select_all_key)
+        self.tree.bind("<Escape>", self._on_clear_selection_key)
+
     def _build_footer(self):
         footer = ThemedFrame(self.root, token="bg")
         footer.grid(row=2, column=0, sticky="ew",
@@ -344,6 +389,12 @@ class PSNUnfrienderGUI:
                                       command=self.unfriend_selected,
                                       bg_token="bg", height=38)
         self.unfriend_button.pack(side=tk.LEFT)
+        # Takes the unfriend button's place for the duration of a run. Built
+        # here but deliberately not packed - _set_removing() swaps the two.
+        self.stop_button = Button(actions, text="Stop", icon="cross",
+                                  variant="secondary", command=self.stop_removal,
+                                  bg_token="bg", height=38,
+                                  tooltip="Stop after the current removal")
 
     def _build_menubar(self):
         # Add "About" menu for info/help
@@ -500,7 +551,36 @@ class PSNUnfrienderGUI:
         self.progress["value"] = 0
         self.loaded_once = self.loaded_once or bool(self.all_friends)
         self._refresh_counts()
+        self._update_selection_ui()
         self._update_overlays(shown)
+
+    def _set_removing(self, active):
+        """Swap the unfriend and stop buttons. Must run on the UI thread.
+
+        Kept in one place so the two buttons can never both be visible or both
+        be hidden, whichever path a run ends on.
+        """
+        if active:
+            self.unfriend_button.pack_forget()
+            self.stop_button.set_text("Stop")
+            self.stop_button.set_enabled(True)
+            self.stop_button.pack(side=tk.LEFT)
+        else:
+            self.stop_button.pack_forget()
+            self.unfriend_button.pack(side=tk.LEFT)
+        self.undo_button.set_enabled(not active)
+
+    def stop_removal(self):
+        if self._stop_event is None:
+            return
+        self._stop_event.set()
+        # Disable rather than hide: a second click should do nothing, but the
+        # button staying put confirms the first click registered.
+        self.stop_button.set_text("Stopping...")
+        self.stop_button.set_enabled(False)
+        self.status_label.config(
+            text="Stopping - finishing the removal already in progress...")
+        log_action("Stop requested during removal.")
 
     def _refresh_counts(self):
         self.keep_badge.set(count=len(self.to_keep))
@@ -551,30 +631,99 @@ class PSNUnfrienderGUI:
 
     # --- filtering -------------------------------------------------------
 
-    def _schedule_filter(self, *_args):
-        """Debounce live filtering: one redraw ~220ms after typing stops."""
-        if self._filter_handle is not None:
-            try:
-                self.root.after_cancel(self._filter_handle)
-            except tk.TclError:
-                pass
-        self._filter_handle = self.root.after(220, self._run_filter)
-
-    def _run_filter(self):
-        self._filter_handle = None
-        if self.all_friends:
-            self.display_friends()
-
-    def apply_search(self):
+    def _cancel_pending_filter(self):
         if self._filter_handle is not None:
             try:
                 self.root.after_cancel(self._filter_handle)
             except tk.TclError:
                 pass
             self._filter_handle = None
-        self.display_friends()
+
+    def _schedule_filter(self, *_args):
+        """Debounce live filtering: one redraw ~220ms after typing stops."""
+        self._cancel_pending_filter()
+        self._filter_handle = self.root.after(220, self._run_filter)
+
+    def _run_filter(self):
+        self._filter_handle = None
+        if self.all_friends:
+            # Carry the selection through the redraw via the reselect-by-ID
+            # path, so narrowing the filter does not silently drop rows the
+            # user had already picked and leave the count wrong.
+            self.display_friends(select_ids=self._current_selection_ids())
+
+    def apply_search(self):
+        self._cancel_pending_filter()
+        self.display_friends(select_ids=self._current_selection_ids())
 
     # --- selection tinting ------------------------------------------------
+
+    def _current_selection_ids(self):
+        """Account IDs (str) of the current selection, for reselect-by-ID."""
+        return {pid for _, pid in self.selected_rows()}
+
+    def select_all(self):
+        """Select every friend in the list - not just the filtered rows.
+
+        Rows excluded by the search/tag filter are not in the Treeview at all,
+        so a selection physically cannot hold them. Rather than tracking a
+        shadow set of invisible IDs - which would let the "N selected" badge
+        disagree with the visible table immediately before an irreversible bulk
+        unfriend - this clears the filter first and then selects what is drawn.
+        What you see stays what is selected.
+        """
+        if not self.all_friends:
+            self.toast("No friends loaded yet.", tone="warning")
+            return
+
+        was_filtered = bool(self.search_var.get().strip()
+                            or self.tag_var.get().strip())
+        if was_filtered:
+            self.search_var.set("")
+            self.tag_var.set("")
+            # Clearing the boxes fires the trace, which queues a debounced
+            # redraw; cancel it so it cannot wipe the selection 220ms later.
+            self._cancel_pending_filter()
+            self.display_friends()
+
+        rows = self.tree.get_children()
+        if rows:
+            self.tree.selection_set(rows)
+        self._update_selection_ui()
+        if was_filtered:
+            self.toast(f"Filter cleared. Selected all {len(rows)} friends.",
+                       tone="info")
+
+    def clear_selection(self):
+        selected = self.tree.selection()
+        if selected:
+            self.tree.selection_remove(*selected)
+        self._update_selection_ui()
+
+    def _on_select_all_key(self, _event=None):
+        self.select_all()
+        return "break"
+
+    def _on_clear_selection_key(self, _event=None):
+        self.clear_selection()
+        return "break"
+
+    def _update_selection_ui(self):
+        """Keep the count badge and the scope hint truthful."""
+        count = len(self.tree.selection())
+        total = len(self.all_friends)
+        shown = len(self.tree.get_children())
+        self.selection_badge.set(label=f"{count} selected")
+        self.select_all_button.set_text(
+            f"Select All ({total})" if total else "Select All")
+        if not total:
+            self.scope_label.configure(text="")
+        elif shown != total:
+            self.scope_label.configure(
+                text=f"Filter active: {shown} of {total} rows shown. "
+                     f"Select All clears the filter and takes all {total}.")
+        else:
+            self.scope_label.configure(text=f"All {total} rows shown.")
 
     def _on_tree_select(self, _event=None):
         """Re-tag rows on selection.
@@ -591,6 +740,7 @@ class PSNUnfrienderGUI:
             if self.tree.exists(iid):
                 self.tree.item(iid, tags=("selected_row",))
         self._selected_iids = current
+        self._update_selection_ui()
 
     def export_csv(self):
         if not self.all_friends:
@@ -685,8 +835,12 @@ class PSNUnfrienderGUI:
         if not self.to_remove:
             self.toast("Nothing is queued for removal.", tone="warning")
             return
-        count = len(self.to_remove)
-        preview = "\n".join(name for _pid, name in self.to_remove[:25])
+        # Snapshot the bucket ONCE, up front, and drive both the confirmation
+        # text and the removal from that same list. The dialog can therefore
+        # never understate what is about to be deleted.
+        to_unfriend = list(self.to_remove)
+        count = len(to_unfriend)
+        preview = "\n".join(name for _pid, name in to_unfriend[:25])
         if count > 25:
             preview += f"\n... and {count - 25} more"
         # Irreversible: "Undo Last Unfriend" only whitelists the names so they
@@ -702,24 +856,58 @@ class PSNUnfrienderGUI:
             tone="danger", icon="trash", details=preview)
         if not confirmed:
             return
-        self.progress["maximum"] = len(self.to_remove)
+        self.progress["maximum"] = count
         self.progress["value"] = 0
         self.status_label.config(text="Removing friends...")
-        self.unfriend_button.set_enabled(False)
-        to_unfriend = list(self.to_remove)
+        self._stop_event = threading.Event()
+        self._set_removing(True)
         def progress_callback(done, total):
             # Called from the worker thread, so bounce every widget touch
             # through root.after() rather than updating in place.
             self.root.after(0, lambda: self._unfriend_progress(done, total))
         def worker():
             try:
-                unfriender.remove_friends(self.auth, to_unfriend, progress_callback)
-                self.last_unfriended = to_unfriend
-                self.root.after(0, lambda: self.toast(
-                    f"Removed {len(to_unfriend)} friend(s).", tone="success"))
-                self.root.after(0, lambda: self.status_label.config(text="Done."))
+                # remove_friends isolates per-friend failures, so a rate limit
+                # partway through no longer discards the whole run. Report what
+                # actually happened rather than assuming everything succeeded.
+                result = unfriender.remove_friends(
+                    self.auth, to_unfriend, progress_callback,
+                    stop_event=self._stop_event)
+                removed, failures = result.removed, result.failures
+                # Undo must offer only the friends PSN actually accepted.
+                self.last_unfriended = removed
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Stopped." if result.stopped else "Done."))
                 self.root.after(0, self.load_friends)
-                log_action(f"Unfriended {len(to_unfriend)} friends.")
+                log_action(
+                    f"{'Stopped after unfriending' if result.stopped else 'Unfriended'} "
+                    f"{len(removed)} of {count} friends"
+                    f"{f', {len(failures)} failed' if failures else ''}.")
+                if result.stopped:
+                    # Already-removed friends are gone for good, so say so
+                    # plainly rather than implying the run simply cancelled.
+                    self.root.after(0, lambda: self.alert(
+                        "Removal stopped",
+                        f"Stopped after removing {len(removed)} of {count}. "
+                        "Those removals are permanent. The remaining "
+                        f"{count - len(removed)} are still on your friends "
+                        "list and the list has been reloaded.",
+                        tone="warning"))
+                elif failures:
+                    detail = "\n".join(
+                        f"{f[1]}: {err}" for f, err in failures[:25])
+                    if len(failures) > 25:
+                        detail += f"\n... and {len(failures) - 25} more"
+                    self.root.after(0, lambda: self.alert(
+                        "Finished with errors",
+                        f"Removed {len(removed)} of {count}. "
+                        f"{len(failures)} could not be removed and are still "
+                        "on your friends list - the list has been reloaded, so "
+                        "you can queue them again.",
+                        tone="warning", details=detail))
+                else:
+                    self.root.after(0, lambda: self.toast(
+                        f"Removed {len(removed)} friend(s).", tone="success"))
             except Exception as e:
                 message = str(e)
                 self.root.after(0, lambda: self.alert(
@@ -727,7 +915,8 @@ class PSNUnfrienderGUI:
                     "through. Reload the list to see the current state.",
                     tone="danger", details=message))
             finally:
-                self.root.after(0, lambda: self.unfriend_button.set_enabled(True))
+                self.root.after(0, lambda: self._set_removing(False))
+                self._stop_event = None
         threading.Thread(target=worker, daemon=True).start()
 
     def _unfriend_progress(self, done, total):
@@ -830,6 +1019,10 @@ class PSNUnfrienderGUI:
         rows = self.selected_rows()
         if not rows:
             return
+        # Per-row prompting is right for a handful of rows and hostile for
+        # hundreds - and Select All now routinely selects the whole list.
+        if len(rows) > BULK_NOTE_THRESHOLD:
+            return self._edit_notes_bulk(rows)
         changed = False
         for name, _pid in rows:
             old_note = self.notes.get(name, "")
@@ -846,6 +1039,30 @@ class PSNUnfrienderGUI:
             save_notes(self.notes)
             self.display_friends(select_ids={pid for _, pid in rows})
             self.toast("Notes saved.", tone="success")
+
+    def _edit_notes_bulk(self, rows):
+        """Ask once, apply to every selected row.
+
+        Prefilled with the shared note when the selection already agrees, so
+        the common "retag this whole group" case is a single confirm.
+        """
+        existing = {self.notes.get(name, "") for name, _pid in rows}
+        initial = existing.pop() if len(existing) == 1 else ""
+        note = Modal.ask_string(
+            self.root, "Edit Note/Tag",
+            f"Note or tag for all {len(rows)} selected friends",
+            initial=initial,
+            message=f"This replaces the existing note on all {len(rows)} "
+                    f"selected friends. Leave it empty to clear them. "
+                    f"Tags are searchable from the filter bar.")
+        if note is None:
+            return
+        for name, _pid in rows:
+            self.notes[name] = note
+        save_notes(self.notes)
+        log_action(f"Bulk-edited note for {len(rows)} friends: {note}")
+        self.display_friends(select_ids={pid for _, pid in rows})
+        self.toast(f"Note applied to {len(rows)} friends.", tone="success")
 
     def move_to_keep(self):
         self.move_selection("Keep")
