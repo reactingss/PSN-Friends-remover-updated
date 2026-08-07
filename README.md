@@ -25,9 +25,11 @@ Whether you have a few friends or hundreds, **PSN Unfriender** makes it easy to 
 - 📊 Compare friend list backups
 - ↩️ Undo previous actions
 - 📈 Progress tracking and detailed logging
-- 🌙 Light & Dark themes
+- 🎨 Fully themed interface — deep indigo dark mode and a clean light mode, both first-class
+- 🧩 Custom-built UI component library (cards, pill badges, toasts, modals, toggle switch)
+- ⌨️ Hover, press and keyboard-focus states on every control
 - 💻 Cross-platform support
-- ⚡ Portable with minimal setup
+- ⚡ Portable — **zero UI dependencies**, pure `tkinter`/`ttk` from the standard library
 
 ---
 
@@ -37,11 +39,13 @@ Whether you have a few friends or hundreds, **PSN Unfriender** makes it easy to 
 
 Add screenshots or animated GIFs here to showcase:
 
-- Main Dashboard
-- Friend List
-- Whitelist Editor
-- Backup Manager
-- Dark Theme
+- Main dashboard (dark theme)
+- Main dashboard (light theme)
+- Friend list with Keep / Remove badges
+- Empty state before friends are loaded
+- Loading overlay during the PSN fetch
+- Unfriend confirmation modal
+- Whitelist and notes editing
 
 ---
 
@@ -67,10 +71,12 @@ With whitelist protection, backups and preview functionality, you'll always know
 
 ## 📋 Requirements
 
-- Python 3.8+
+- Python 3.8+ (with `tkinter`, which ships with the standard Windows and macOS installers; on Debian/Ubuntu install `python3-tk`)
 - Windows / macOS / Linux
 - PlayStation Network account
 - Internet connection
+
+The interface adds **no dependencies beyond the standard library** — `requirements.txt` covers the PSN API client only.
 
 ---
 
@@ -153,20 +159,65 @@ The CLI will:
 python gui.py
 ```
 
-GUI Features:
+The window is laid out as **header → connection card → filter bar → friends table → status footer**. It is resizable, with the table taking the flexible space and a 940×600 minimum.
 
-- Load Friends
-- Search Friends
-- Filter Friends
-- Edit Notes
-- Edit Tags
-- Manage Whitelist
-- Import Backups
-- Export Backups
-- Compare Backups
-- Dark Mode
-- Progress Bar
-- Confirmation Dialogs
+GUI features:
+
+- Load friends, with a loading overlay while the PSN fetch runs
+- Live search-as-you-type (debounced) plus tag filtering
+- Keep / Remove shown as colour-coded pill badges with live counts
+- Right-click context menu — whitelist, edit note/tag, move between buckets
+- Double-click a row to edit its note
+- Drag a row onto the other bucket to move it
+- Edit notes and tags
+- Manage the whitelist
+- Import, export and compare backups
+- Determinate progress bar and status footer
+- Toast notifications for routine feedback
+- Styled modal dialogs for errors, confirmations and prompts
+- Dark and light themes, switchable from the header toggle or the Settings menu
+- Empty state shown before any friends are loaded
+
+---
+
+## 🎨 Interface
+
+The UI is built entirely on the Python standard library — `tkinter`, `ttk` and `Canvas`. **No `customtkinter`, `ttkbootstrap`, `Pillow` or image assets are required**, so the app runs on a stock Python install with no network access.
+
+### Design system
+
+Colours are defined as semantic tokens (`surface`, `border`, `text`, `accent`, `danger`, `success`, …) rather than raw hex, so both themes come from the same token names and switching themes restyles the live window instantly — including the `Treeview`, entries, scrollbars and progress bar.
+
+| | Dark (default) | Light |
+|---|---|---|
+| Background | `#0B0F1D` | `#EDF0F8` |
+| Surface | `#131A2E` | `#FFFFFF` |
+| Accent | `#2E6BE6` | `#2E6BE6` |
+
+Type scale runs from an 8pt eyebrow to a 17pt display in Segoe UI (with a fallback chain), on a 4/8px spacing rhythm.
+
+All foreground/background pairs meet **WCAG AA (4.5:1)** in both themes. Because a vivid blue cannot brighten on hover without dropping its white label below AA, buttons signal hover with a rim highlight instead of a large fill shift.
+
+### Components
+
+`Button` (4 variants), `InputField`, `ToggleSwitch`, `Badge`, `Card`, `Tooltip`, `Spinner`, `SlimScrollbar`, `EmptyState`, `LoadingOverlay`, `Toast` and `Modal` — all drawn on `Canvas` with hover, press and focus-ring states. Icons are vector shapes drawn in code, not image files.
+
+### Project structure
+
+```
+PSN-Unfriender-Tool/
+├── gui.py              # GUI application
+├── unfriender.py       # PSN API + CLI
+├── ui/
+│   ├── theme.py        # Design tokens and the ttk stylesheet
+│   ├── icons.py        # Canvas-drawn vector icons
+│   └── widgets.py      # Component library
+├── configuration.json  # Token and whitelist patterns
+├── friend_notes.json   # Saved notes and tags
+└── unfriender.log      # Action log
+```
+
+`python gui.py` remains the entry point, so `run_unfriender.bat` is unaffected.
 
 ---
 
@@ -321,6 +372,14 @@ Treat it exactly like your PlayStation password.
 Yes.
 
 You'll always see who will be removed before confirming.
+
+---
+
+### What does "Undo Last Unfriend" actually do?
+
+It adds the players you just removed to your whitelist, so a future run will not remove them again.
+
+It **cannot re-add them as friends** — PSN requires a new friend request for that. Removing a friend is irreversible, which is why the confirmation dialog states the count and spells this out before you proceed.
 
 ---
 
